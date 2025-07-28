@@ -7,14 +7,14 @@ import argparse
 import os
 from torch.amp import autocast, GradScaler
 
-from model import Tokenizer, Image2LatexModel
-from data_loader import LatexDataset, collate_fn, tokenize_latex # Assuming tokenize_latex is in data_loader
+from model_v2 import Tokenizer, Image2LatexModelV2 # Use the new V2 model
+from data_loader import LatexDataset, collate_fn
 
 def train_one_epoch(model, data_loader, criterion, optimizer, device, epoch, total_epochs, scaler):
     """
     Performs one full training pass over the dataset using mixed precision.
     """
-    model.train()  # Set model to training mode
+    model.train()
     
     total_loss = 0.0
     progress_bar = tqdm(data_loader, desc=f"Epoch {epoch+1}/{total_epochs} [Training]")
@@ -23,27 +23,20 @@ def train_one_epoch(model, data_loader, criterion, optimizer, device, epoch, tot
         images = images.to(device)
         labels = labels.to(device)
         
-        # For teacher forcing, the target sequence is the label sequence shifted by one.
-        # The input to the decoder is the sequence without the last token (<eos>).
-        # The target for the loss function is the sequence without the first token (<sos>).
         tgt_in = labels[:, :-1]
         tgt_out = labels[:, 1:]
         
-        # Create a padding mask for the input sequence
-        # 1s for padding tokens, 0s for real tokens
-        tgt_padding_mask = (tgt_in == 0) # Assumes pad_id is 0
+        tgt_padding_mask = (tgt_in == 0)
 
-        # Zero the gradients
-        optimizer.zero_grad(set_to_none=True) # More efficient
+        optimizer.zero_grad(set_to_none=True)
         
-        # Use autocast for mixed precision forward pass
         with autocast(device_type=device.type, dtype=torch.float16):
             predictions = model(images, tgt_in, tgt_padding_mask=tgt_padding_mask)
+            # The output features for the loss function are now in model.decoder.generator
             loss = criterion(predictions.view(-1, model.decoder.generator.out_features), tgt_out.reshape(-1))
         
-        # Scale loss and perform backward pass
         scaler.scale(loss).backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0) # Clip gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         scaler.step(optimizer)
         scaler.update()
         
@@ -56,7 +49,7 @@ def validate(model, data_loader, criterion, device):
     """
     Evaluates the model on the validation set.
     """
-    model.eval()  # Set model to evaluation mode
+    model.eval()
     total_loss = 0.0
     
     with torch.no_grad():
@@ -69,7 +62,6 @@ def validate(model, data_loader, criterion, device):
             tgt_out = labels[:, 1:]
             tgt_padding_mask = (tgt_in == 0)
             
-            # Use autocast for validation as well for consistency
             with autocast(device_type=device.type, dtype=torch.float16):
                 predictions = model(images, tgt_in, tgt_padding_mask=tgt_padding_mask)
                 loss = criterion(predictions.view(-1, model.decoder.generator.out_features), tgt_out.reshape(-1))
@@ -94,7 +86,6 @@ def main(args):
     print("Loading data...")
     full_train_dataset = LatexDataset(data_dir=args.train_data_dir, tokenizer=tokenizer, augment=True)
     
-    # Use a fraction of the dataset if specified for faster training
     if args.dataset_frac < 1.0:
         dataset_size = len(full_train_dataset)
         subset_size = int(dataset_size * args.dataset_frac)
@@ -113,15 +104,11 @@ def main(args):
     
     # --- Model, Loss, Optimizer ---
     print("Initializing model...")
-    model = Image2LatexModel(vocab_size=vocab_size, d_model=args.d_model, nhead=args.nhead, num_decoder_layers=args.decoder_layers).to(device)
+    # Use the new V2 model
+    model = Image2LatexModelV2(vocab_size=vocab_size, d_model=args.d_model, nhead=args.nhead, num_decoder_layers=args.decoder_layers).to(device)
     
-    # Loss function that ignores padding tokens
     criterion = nn.CrossEntropyLoss(ignore_index=pad_id)
-    
-    # Optimizer
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr)
-    
-    # Initialize GradScaler for mixed precision
     scaler = GradScaler(enabled=args.amp)
     
     # --- Load Checkpoint ---
@@ -138,12 +125,11 @@ def main(args):
 
     # --- Training Loop ---
     print("Starting training with Mixed Precision...")
+    scheduler = ReduceLROnPlateau(optimizer, 'min', patience=args.lr_patience, factor=0.5)
     for epoch in range(start_epoch, args.epochs):
         train_loss = train_one_epoch(model, train_loader, criterion, optimizer, device, epoch, args.epochs, scaler)
         val_loss = validate(model, val_loader, criterion, device)
         
-        # Update learning rate
-        scheduler = ReduceLROnPlateau(optimizer, 'min', patience=args.lr_patience, factor=0.5)
         scheduler.step(val_loss)
         
         print(f"\nEpoch {epoch+1}/{args.epochs} -> Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, LR: {optimizer.param_groups[0]['lr']}\n")
@@ -154,7 +140,6 @@ def main(args):
             print(f"New best model found! Saving to {args.save_path}")
             torch.save(model.state_dict(), args.save_path)
 
-        # Save checkpoint
         print("Saving checkpoint...")
         torch.save({
             'epoch': epoch,
@@ -168,14 +153,15 @@ def main(args):
 
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description="Train the Image-to-LaTeX model with Mixed Precision and Checkpointing.")
+    parser = argparse.ArgumentParser(description="Train the Image-to-LaTeX model (V2 - EfficientNet) with Mixed Precision.")
     
     # Paths
     parser.add_argument('--vocab_path', type=str, default='vocab.json', help='Path to the vocabulary file.')
     parser.add_argument('--train_data_dir', type=str, default='mathwriting-2024/train', help='Directory for training data.')
     parser.add_argument('--val_data_dir', type=str, default='mathwriting-2024/valid', help='Directory for validation data.')
-    parser.add_argument('--save_path', type=str, default='best_model_full.pth', help='Path to save the best performing model.')
-    parser.add_argument('--checkpoint_path', type=str, default='checkpoint.pth', help='Path to save the training checkpoint.')
+    # Changed default paths for V2 model
+    parser.add_argument('--save_path', type=str, default='best_model_v2.pth', help='Path to save the best performing V2 model.')
+    parser.add_argument('--checkpoint_path', type=str, default='checkpoint_v2.pth', help='Path to save the V2 training checkpoint.')
 
     # Model hyperparameters
     parser.add_argument('--d_model', type=int, default=512, help='Dimension of the model.')
@@ -184,7 +170,7 @@ if __name__ == '__main__':
 
     # Training hyperparameters
     parser.add_argument('--epochs', type=int, default=20, help='Number of training epochs.')
-    parser.add_argument('--batch_size', type=int, default=64, help='Batch size for training. Adjust based on your VRAM.')
+    parser.add_argument('--batch_size', type=int, default=32, help='Batch size for training. Adjust based on your VRAM. Default reduced for potentially larger model.')
     parser.add_argument('--lr', type=float, default=5e-5, help='Learning rate.')
     parser.add_argument('--lr_patience', type=int, default=3, help='Patience for learning rate scheduler (in epochs).')
     parser.add_argument('--num_workers', type=int, default=4, help='Number of workers for DataLoader.')
